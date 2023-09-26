@@ -1,6 +1,5 @@
 # image for building
 FROM alpine:latest AS builder
-
 ARG QBT_VERSION
 ARG LIBBT_CMAKE_FLAGS=""
 ARG LIBBT_VERSION="1.2.19"
