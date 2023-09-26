@@ -1,92 +1,139 @@
-# Build-time variables
-ARG ALPINE_VERSION=edge
-ARG RTORRENT_VERSION=0.9.8-r16
-ARG UNRAR_VERSION=6.2.1
-ARG FINDUTILS_VERSION=4.9.0
+# image for building
+FROM alpine:latest AS builder
 
-# Checksums (must be changed for each version version)
-ARG UNRAR_CHECKSUM=5cc8f7ded262d27c29d01e7a119d2fd23edda427711820454f2eb667044a8900
-ARG FINDUTILS_CHECKSUM=a2bfb8c09d436770edc59f50fa483e785b161a3b7b9d547573cb08065fd462fe
+ARG QBT_VERSION
+ARG LIBBT_CMAKE_FLAGS=""
+ARG LIBBT_VERSION="1.2.19"
 
-# GPG keys
-ARG RTORRENT_GPG=A102C2F15053B4F7
+# check environment variables
+RUN \
+  if [ -z "${QBT_VERSION}" ]; then \
+    echo 'Missing QBT_VERSION variable. Check your command line arguments.' && \
+    exit 1 ; \
+  fi
 
-
-# Build rTorrent
-FROM alpine:${ALPINE_VERSION} as build-rtorrent
-
-ARG RTORRENT_VERSION
-ARG RTORRENT_GPG
-
-RUN echo "@testing https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories \
- && apk --no-cache add \
-    bash \
-    bazel@testing \
-    build-base \
-    coreutils \
-    gcompat \
+# alpine linux packages:
+# https://git.alpinelinux.org/aports/tree/community/libtorrent-rasterbar/APKBUILD
+# https://git.alpinelinux.org/aports/tree/community/qbittorrent/APKBUILD
+RUN \
+  apk --update-cache add \
+    boost-dev \
+    cmake \
     git \
-    linux-headers \
-    pythonispython3 \
+    g++ \
+    ninja \
+    openssl-dev \
+    qt6-qtbase-dev \
+    qt6-qttools-dev
+
+# compiler, linker options:
+# https://gcc.gnu.org/onlinedocs/gcc/Option-Summary.html
+# https://gcc.gnu.org/onlinedocs/gcc/Link-Options.html
+# https://sourceware.org/binutils/docs/ld/Options.html
+ENV CFLAGS="-pipe -fstack-clash-protection -fstack-protector-strong -fno-plt -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS" \
+    CXXFLAGS="-pipe -fstack-clash-protection -fstack-protector-strong -fno-plt -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS" \
+    LDFLAGS="-gz -Wl,-O1,--as-needed,--sort-common,-z,now,-z,relro"
+
+# build libtorrent
+RUN \
+  if [ "${LIBBT_VERSION}" = "devel" ]; then \
+    git clone \
+      --depth 1 \
+      --recurse-submodules \
+      https://github.com/arvidn/libtorrent.git && \
+    cd libtorrent ; \
+  else \
+    wget "https://github.com/arvidn/libtorrent/releases/download/v${LIBBT_VERSION}/libtorrent-rasterbar-${LIBBT_VERSION}.tar.gz" && \
+    tar -xf "libtorrent-rasterbar-${LIBBT_VERSION}.tar.gz" && \
+    cd "libtorrent-rasterbar-${LIBBT_VERSION}" ; \
+  fi && \
+  cmake \
+    -B build \
+    -G Ninja \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -Ddeprecated-functions=OFF \
+    $LIBBT_CMAKE_FLAGS && \
+  cmake --build build -j $(nproc) && \
+  cmake --install build
+
+# build qbittorrent
+RUN \
+  if [ "${QBT_VERSION}" = "devel" ]; then \
+    git clone \
+      --depth 1 \
+      --recurse-submodules \
+      https://github.com/qbittorrent/qBittorrent.git && \
+    cd qBittorrent ; \
+  else \
+    wget "https://github.com/qbittorrent/qBittorrent/archive/refs/tags/release-${QBT_VERSION}.tar.gz" && \
+    tar -xf "release-${QBT_VERSION}.tar.gz" && \
+    cd "qBittorrent-release-${QBT_VERSION}" ; \
+  fi && \
+  cmake \
+    -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -DGUI=OFF \
+    -DQT6=ON && \
+  cmake --build build -j $(nproc) && \
+  cmake --install build
+
+RUN \
+  ldd /usr/bin/qbittorrent-nox | sort -f
+
+# record compile-time Software Bill of Materials (sbom)
+RUN \
+  printf "Software Bill of Materials for building qbittorrent-nox\n\n" >> /sbom.txt && \
+  if [ "${LIBBT_VERSION}" = "devel" ]; then \
+    cd libtorrent && \
+    echo "libtorrent-rasterbar git $(git rev-parse HEAD)" >> /sbom.txt && \
+    cd .. ; \
+  else \
+    echo "libtorrent-rasterbar ${LIBBT_VERSION}" >> /sbom.txt ; \
+  fi && \
+  if [ "${QBT_VERSION}" = "devel" ]; then \
+    cd qBittorrent && \
+    echo "qBittorrent git $(git rev-parse HEAD)" >> /sbom.txt && \
+    cd .. ; \
+  else \
+    echo "qBittorrent ${QBT_VERSION}" >> /sbom.txt ; \
+  fi && \
+  echo >> /sbom.txt && \
+  apk list -I | sort >> /sbom.txt && \
+  cat /sbom.txt
+
+# image for running
+FROM alpine:latest
+
+RUN \
+  apk --no-cache add \
+    bash \
+    curl \
+    doas \
     python3 \
-    gnupg \
- && git clone --depth 1 --branch v${RTORRENT_VERSION} https://github.com/jesec/rtorrent/ && cd rtorrent \
- && gpg --recv-keys ${RTORRENT_GPG} \
- && TAG=$(git describe --tags) \
- && git verify-tag ${TAG} || { git verify-tag --raw "${TAG}" 2>&1 | grep EXPKEYSIG; } \
- && sed -i 's/architecture = \"all\"/architecture = \"amd64\"/' BUILD.bazel \
- && bazel build rtorrent --features=fully_static_link --verbose_failures --copt="-Wno-error=deprecated-declarations"
+    qt6-qtbase \
+    qt6-qtbase-sqlite \
+    tini \
+    tzdata
 
+RUN \
+  adduser \
+    -D \
+    -H \
+    -s /sbin/nologin \
+    -u 1000 \
+    qbtUser && \
+  echo "permit nopass :root" >> "/etc/doas.d/doas.conf"
 
-# Build unrar
-FROM alpine:${ALPINE_VERSION} as build-unrar
+COPY --from=builder /usr/bin/qbittorrent-nox /usr/bin/qbittorrent-nox
 
-ARG UNRAR_VERSION
-ARG UNRAR_CHECKSUM
+COPY --from=builder /sbom.txt /sbom.txt
 
-RUN apk --no-cache add make g++ \
- && wget -q -O /tmp/unrar.tar.gz https://www.rarlab.com/rar/unrarsrc-${UNRAR_VERSION}.tar.gz \
- && CHECKSUM_STATE=$(echo -n $(echo "${UNRAR_CHECKSUM}  /tmp/unrar.tar.gz" | sha256sum -c) | tail -c 2) \
- && if [ "${CHECKSUM_STATE}" != "OK" ]; then echo "Error: checksum does not match" && exit 1; fi \
- && cd /tmp && tar xzf unrar.tar.gz && cd unrar \
- && sed -i -e 's/LDFLAGS=-pthread/LDFLAGS=-static -pthread/g' makefile \
- && make
+COPY entrypoint.sh /entrypoint.sh
 
-
-# Build find
-FROM alpine:${ALPINE_VERSION} as build-find
-
-ARG FINDUTILS_VERSION
-ARG FINDUTILS_CHECKSUM
-
-RUN apk --no-cache add build-base \
- && wget -q -O /tmp/find.tar.xz https://ftp.gnu.org/gnu/findutils/findutils-${FINDUTILS_VERSION}.tar.xz \
- && CHECKSUM_STATE=$(echo -n $(echo "${FINDUTILS_CHECKSUM}  /tmp/find.tar.xz" | sha256sum -c) | tail -c 2) \
- && if [ "${CHECKSUM_STATE}" != "OK" ]; then echo "Error: checksum does not match" && exit 1; fi \
- && cd /tmp && mkdir find && tar xf find.tar.xz -C find --strip-components 1 && cd find \
- && ./configure LDFLAGS="-static" \
- && make
-
-
-# Prepare rtunrar
-FROM alpine:edge as get-rtunrar
-
-COPY rtunrar.sh .
-
-RUN chmod +x rtunrar.sh
-
-
-# Build final image
-FROM gcr.io/distroless/static as final
-
-COPY --from=build-rtorrent /rtorrent/bazel-bin/rtorrent /usr/local/bin/
-COPY --from=build-unrar /tmp/unrar/unrar /usr/local/bin/
-COPY --from=build-find /tmp/find/find/find /usr/local/bin/
-COPY --from=get-rtunrar /rtunrar.sh /usr/local/bin/rtunrar
-COPY --from=gcr.io/distroless/static:debug /busybox/sh /bin/sh
-
-ENV HOME=/config
-
-USER 1000:1000
-
-ENTRYPOINT ["rtorrent"]
+ENTRYPOINT ["/sbin/tini", "-g", "--", "/entrypoint.sh"]
